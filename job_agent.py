@@ -1,12 +1,10 @@
 """
-Job Posting Notifier Agent — Google Sheets edition (v2.1)
-- v2.1: Microsoft selector hardened. Debug dump fires when extraction returns
-        zero jobs even if a selector matched.
-- v2.0: Workday, SmartRecruiters, BambooHR, Taleo, SuccessFactors, Airbnb.
-- v1.4: Playwright debug dump
-- v1.3: Playwright support
-- v1.2: Hardened fuzzy matching
-- v1.1: Match-only baseline, smarter title matching, HTML scraper de-dup
+Job Posting Notifier Agent — Google Sheets edition (v2.2)
+- v2.2: Eightfold (Netflix), Microsoft scoped to search results,
+        FORCE_ALERTS test mode
+- v2.1: Microsoft selector hardened, smarter debug
+- v2.0: Workday, SmartRecruiters, BambooHR, Taleo, SuccessFactors, Airbnb
+- v1.x: foundations
 """
 import csv
 import io
@@ -26,6 +24,10 @@ SHEET_CSV_URL = os.environ.get("SHEET_CSV_URL")
 SEEN_FILE = "seen_jobs.json"
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT = os.environ.get("TG_CHAT_ID")
+
+# Set FORCE_ALERTS=1 in workflow env to re-alert on all current matches once.
+# Useful for testing notifications without waiting for new jobs.
+FORCE_ALERTS = os.environ.get("FORCE_ALERTS", "").lower() in ("1", "true", "yes")
 
 FUZZY_THRESHOLD = 90
 FUZZY_MIN_LENGTH = 8
@@ -110,6 +112,13 @@ def detect_scraper(url):
         if sub and sub != "www":
             return "bamboohr", {"company_slug": sub}
 
+    # Eightfold: jobs.<tenant>.net or explore.jobs.<tenant>.net
+    if "jobs.netflix.net" in host or ".eightfold.ai" in host:
+        return "eightfold", {"raw_url": url}
+    # Generic Eightfold detection: explore.jobs.<x>.net pattern
+    if "explore.jobs" in host:
+        return "eightfold", {"raw_url": url}
+
     if "successfactors" in host or "/careersection/" in path:
         return "successfactors", {"raw_url": url}
 
@@ -185,11 +194,7 @@ def scrape_smartrecruiters(company_slug):
                 loc.get("city", ""), loc.get("region", ""), loc.get("country", "")
             ]))
             job_url = f"https://jobs.smartrecruiters.com/{company_slug}/{j.get('id', '')}"
-            jobs.append({
-                "title": j.get("name", ""),
-                "location": loc_str,
-                "url": job_url,
-            })
+            jobs.append({"title": j.get("name", ""), "location": loc_str, "url": job_url})
         if len(content) < limit:
             break
         offset += limit
@@ -214,6 +219,66 @@ def scrape_bamboohr(company_slug):
         job_id_val = j.get("id")
         job_url = f"https://{company_slug}.bamboohr.com/careers/{job_id_val}" if job_id_val else url
         jobs.append({"title": title, "location": loc_str, "url": job_url})
+    return jobs
+
+
+def scrape_eightfold(raw_url):
+    """Eightfold (Netflix, others) embeds positions data as JSON in the page.
+    We fetch the careers page and extract the JSON block."""
+    # Eightfold also has an API — try that first
+    parsed = urlparse(raw_url)
+    host = parsed.netloc.lower()
+
+    # Try the API endpoint pattern Eightfold uses
+    api_url = f"https://{host}/api/apply/v2/jobs?domain={host.replace('explore.jobs.', '').replace('.net', '.com')}"
+    api_url += "&start=0&num=100&exact_phrase=&query=&Country=&Location=&"
+    try:
+        r = requests.get(api_url, headers=HEADERS, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            positions = data.get("positions", [])
+            if positions:
+                return _parse_eightfold_positions(positions)
+    except Exception:
+        pass
+
+    # Fallback: scrape the embedded JSON from the careers page
+    try:
+        r = requests.get(raw_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"  [Eightfold] Fetch failed: {e}")
+        return []
+
+    # Look for "positions": [...] block in the page source
+    match = re.search(r'"positions"\s*:\s*(\[[^\]]*\])', r.text)
+    if not match:
+        # Try a more lenient match — capture larger JSON
+        match = re.search(r'"positions":\s*(\[.*?\])\s*,\s*"', r.text, re.DOTALL)
+    if not match:
+        print(f"  [Eightfold] Could not find positions JSON in page.")
+        return []
+
+    try:
+        positions = json.loads(match.group(1))
+    except Exception as e:
+        print(f"  [Eightfold] JSON parse failed: {e}")
+        return []
+
+    return _parse_eightfold_positions(positions)
+
+
+def _parse_eightfold_positions(positions):
+    jobs = []
+    for p in positions:
+        title = p.get("name") or p.get("posting_name") or ""
+        if not title:
+            continue
+        # Locations can be a list or a single string
+        locs = p.get("locations") or [p.get("location", "")]
+        loc_str = " | ".join(filter(None, locs)) if isinstance(locs, list) else str(locs)
+        url = p.get("canonicalPositionUrl") or ""
+        jobs.append({"title": title, "location": loc_str, "url": url})
     return jobs
 
 
@@ -263,7 +328,6 @@ def _scrape_workday_endpoint(api_url, base_host):
     return jobs
 
 
-# ---------- SUCCESSFACTORS ----------
 def scrape_successfactors(raw_url):
     try:
         r = requests.get(raw_url, headers=HEADERS, timeout=20)
@@ -287,12 +351,9 @@ def scrape_successfactors(raw_url):
             continue
         seen_urls.add(key)
         jobs.append({"title": title, "location": "", "url": href})
-    if not jobs:
-        print(f"  [SuccessFactors] No jobs extracted from HTML.")
     return jobs
 
 
-# ---------- TALEO ----------
 def scrape_taleo(raw_url):
     try:
         r = requests.get(raw_url, headers=HEADERS, timeout=20)
@@ -319,7 +380,6 @@ def scrape_taleo(raw_url):
     return jobs
 
 
-# ---------- HTML FALLBACK ----------
 def scrape_html(url, selector):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
@@ -385,7 +445,6 @@ def _debug_dump(page, label):
         title = page.title()
         url = page.url
         body_text = page.evaluate("() => document.body.innerText.slice(0, 1500)")
-        # Show all elements with role=listitem and their inner structure
         listitems_info = page.evaluate("""() => {
             const items = document.querySelectorAll('[role="listitem"]');
             return Array.from(items).slice(0, 5).map((el, i) => ({
@@ -394,23 +453,12 @@ def _debug_dump(page, label):
                 text_preview: el.innerText.slice(0, 200),
             }));
         }""")
-        headings = page.evaluate("""() => {
-            const els = document.querySelectorAll('h1, h2, h3');
-            return Array.from(els).slice(0, 15).map(e => ({
-                tag: e.tagName.toLowerCase(),
-                text: e.innerText.trim().slice(0, 100),
-                classes: e.className.slice(0, 80)
-            }));
-        }""")
         print(f"  [DEBUG {label}] title='{title}' url='{url}'")
         print(f"  [DEBUG {label}] body_text_preview:\n{'-'*40}\n{body_text[:800]}\n{'-'*40}")
-        print(f"  [DEBUG {label}] first {len(listitems_info)} role=listitem elements:")
+        print(f"  [DEBUG {label}] first {len(listitems_info)} role=listitem:")
         for item in listitems_info:
             print(f"    [{item['idx']}] text: {item['text_preview']}")
             print(f"        html: {item['outerHTML_preview']}")
-        print(f"  [DEBUG {label}] first {len(headings)} headings:")
-        for h in headings:
-            print(f"    <{h['tag']} class='{h['classes']}'> {h['text']}")
     except Exception as e:
         print(f"  [DEBUG {label}] dump failed: {e}")
 
@@ -475,17 +523,13 @@ def scrape_playwright_google(target_titles, target_country):
                 jobs.append({"title": title, "location": loc_text, "url": href or url})
             except Exception:
                 continue
-        # Trigger debug dump if extraction got nothing
-        if not jobs:
-            print("  [Playwright] Extracted 0 jobs despite matched selector. Dumping page.")
-            _debug_dump(page, "google")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
 
 
 def scrape_playwright_microsoft(target_titles, target_country):
-    """Microsoft Careers — improved extraction with broader title hunting."""
+    """Microsoft Careers — scoped to results region only (avoid filter sidebar)."""
     query = " ".join(target_titles) if target_titles else ""
     base = "https://jobs.careers.microsoft.com/global/en/search"
     params = []
@@ -503,17 +547,22 @@ def scrape_playwright_microsoft(target_titles, target_country):
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(8)
 
-        # Try multiple containers
-        candidates = [
-            "div[role='listitem']",
-            "[data-automation-id*='jobCard']",
-            "div[class*='ms-List-cell']",
-            "div[class*='SearchResultCard']",
-            "div[class*='jobCard']",
+        # Scope the search to the main results region. Microsoft's filter
+        # sidebar also has role=listitem — we need to avoid it.
+        # Try scoped selectors that target ONLY the results column.
+        scoped_candidates = [
+            # Anchor links to specific job pages — most reliable
+            "a[href*='/global/en/job/']",
+            "a[href*='/job/']",
+            # Cards inside main content
+            "main [role='listitem']",
+            "[role='main'] [role='listitem']",
+            "main div[class*='ms-List-cell']",
+            "div[data-automation-id*='jobCard']",
         ]
         cards = []
         chosen_sel = None
-        for sel in candidates:
+        for sel in scoped_candidates:
             try:
                 found = page.query_selector_all(sel)
                 if found:
@@ -528,62 +577,68 @@ def scrape_playwright_microsoft(target_titles, target_country):
             _debug_dump(page, "microsoft")
             return []
 
-        # Extract — try MANY title sources per card
         for card in cards:
             try:
+                # If the card itself is an anchor with aria-label, that's typically the title
+                tag = card.evaluate("el => el.tagName")
                 title = ""
-                # Strategy: get all text content of the card, take first non-trivial line
-                # that looks like a job title (more than 5 chars, not a button label)
-                full_text = card.inner_text() if card else ""
-                # Try heading first
-                for tsel in ["h2", "h3", "h4", "[role='heading']",
-                             "[class*='jobTitle']", "[class*='Title']",
-                             "a[aria-label]"]:
-                    title_el = card.query_selector(tsel)
-                    if title_el:
-                        # Try aria-label first if it's an anchor — often holds full title
-                        aria = title_el.get_attribute("aria-label") if tsel.startswith("a") else None
-                        cand = aria or title_el.inner_text().strip()
-                        if cand and len(cand) > 5:
-                            title = cand.split("\n")[0].strip()
-                            break
+                href = ""
 
-                # Fallback: parse first meaningful line of text
-                if not title and full_text:
-                    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
-                    # Skip lines that look like buttons / metadata
-                    skip_keywords = {"save", "apply", "share", "view", "details",
-                                     "remote", "hybrid", "onsite", "full-time", "part-time"}
-                    for line in lines:
-                        line_lower = line.lower()
-                        if line and len(line) > 5 and line_lower not in skip_keywords \
-                                and not any(line_lower == k for k in skip_keywords):
-                            title = line[:120]
-                            break
+                if tag == "A":
+                    aria = card.get_attribute("aria-label") or ""
+                    href = card.get_attribute("href") or ""
+                    if aria:
+                        title = aria.strip()
+                    else:
+                        # Take first line of inner text
+                        raw = card.inner_text().strip()
+                        title = raw.split("\n")[0][:120] if raw else ""
+                else:
+                    # Card-style element — look for title inside
+                    for tsel in ["h2", "h3", "h4", "[role='heading']",
+                                 "a[aria-label]", "[class*='jobTitle']"]:
+                        title_el = card.query_selector(tsel)
+                        if title_el:
+                            aria = title_el.get_attribute("aria-label")
+                            cand = aria or title_el.inner_text().strip()
+                            if cand and len(cand) > 5:
+                                title = cand.split("\n")[0]
+                                break
+                    a = card.query_selector("a")
+                    if a:
+                        href = a.get_attribute("href") or ""
 
-                if not title:
+                if not title or len(title) < 5:
                     continue
 
-                loc_text = ""
-                for lsel in ["[aria-label*='Location']", "[class*='location']",
-                             "[class*='Location']"]:
-                    loc_el = card.query_selector(lsel)
-                    if loc_el:
-                        loc_text = loc_el.inner_text().strip()
-                        break
+                # Filter out obvious non-titles (filter labels, button text)
+                title_lower = title.lower()
+                if title_lower in {"save", "apply", "share", "view", "details",
+                                   "architecture", "engineering", "research",
+                                   "computer science", "software engineering"}:
+                    continue
+                # If it's a single word with no spaces and short, likely a category
+                if len(title.split()) == 1 and len(title) < 15:
+                    continue
 
-                link_el = card.query_selector("a")
-                href = link_el.get_attribute("href") if link_el else ""
                 if href and href.startswith("/"):
                     href = urljoin("https://jobs.careers.microsoft.com", href)
+
+                loc_text = ""
+                if tag != "A":
+                    for lsel in ["[aria-label*='Location']", "[class*='location']"]:
+                        loc_el = card.query_selector(lsel)
+                        if loc_el:
+                            loc_text = loc_el.inner_text().strip()
+                            break
+
                 jobs.append({"title": title, "location": loc_text, "url": href or url})
             except Exception:
                 continue
 
-        # If extraction failed entirely, dump the page
         if not jobs:
             print(f"  [Playwright] Extracted 0 jobs from {len(cards)} '{chosen_sel}' "
-                  f"elements. Dumping page for diagnosis.")
+                  f"elements. Dumping page.")
             _debug_dump(page, "microsoft")
     finally:
         ctx.close()
@@ -614,7 +669,6 @@ def scrape_playwright_revolut(target_titles, target_country):
                 print(f"  [Playwright] Selector '{sel}' matched {len(cards)} elements")
                 break
         if not cards:
-            _debug_dump(page, "revolut")
             return []
 
         for card in cards:
@@ -637,8 +691,6 @@ def scrape_playwright_revolut(target_titles, target_country):
                 jobs.append({"title": title, "location": loc_text, "url": href or url})
             except Exception:
                 continue
-        if not jobs:
-            _debug_dump(page, "revolut")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
@@ -665,7 +717,6 @@ def scrape_playwright_airbnb(target_titles, target_country):
                 cards = found
                 break
         if not cards:
-            _debug_dump(page, "airbnb")
             return []
 
         for card in cards:
@@ -690,8 +741,6 @@ def scrape_playwright_airbnb(target_titles, target_country):
                 jobs.append({"title": title, "location": loc_text, "url": href or base})
             except Exception:
                 continue
-        if not jobs:
-            _debug_dump(page, "airbnb")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
@@ -719,6 +768,8 @@ def fetch_jobs(company):
         return scrape_smartrecruiters(**args)
     if stype == "bamboohr":
         return scrape_bamboohr(**args)
+    if stype == "eightfold":
+        return scrape_eightfold(**args)
     if stype == "workday":
         return scrape_workday(**args)
     if stype == "workday_alt":
@@ -808,6 +859,8 @@ def send_telegram(text):
 def main():
     companies = load_companies_from_sheet()
     print(f"Loaded {len(companies)} active companies from sheet.")
+    if FORCE_ALERTS:
+        print("FORCE_ALERTS=1 set — will send alerts for ALL current matches.")
 
     first_run = not Path(SEEN_FILE).exists()
     seen = set(json.loads(Path(SEEN_FILE).read_text())) if not first_run else set()
@@ -835,11 +888,13 @@ def main():
                     if len(sample_misses) < 3:
                         sample_misses.append(job)
 
-                if jid in seen:
-                    continue
                 if is_match:
                     new_seen.add(jid)
-                    if not first_run:
+                    # In FORCE_ALERTS mode, alert on every match regardless of seen.
+                    # Otherwise: only new matches not in seen.
+                    if FORCE_ALERTS:
+                        alerts.append((c["name"], job))
+                    elif jid not in seen and not first_run:
                         alerts.append((c["name"], job))
 
             total_jobs_scanned += len(jobs)
@@ -851,7 +906,7 @@ def main():
     finally:
         _close_browser()
 
-    if first_run:
+    if first_run and not FORCE_ALERTS:
         baseline_count = len(new_seen)
         print(f"First run: baselining {baseline_count} matching jobs "
               f"(out of {total_jobs_scanned} total scanned). No alerts sent.")
@@ -862,6 +917,11 @@ def main():
             f"(out of {total_jobs_scanned} open roles)"
         )
     else:
+        # Cap alerts to avoid Telegram rate-limit floods
+        max_alerts = 25
+        if len(alerts) > max_alerts:
+            print(f"Capping alerts at {max_alerts} (had {len(alerts)} matches)")
+            alerts = alerts[:max_alerts]
         for company, job in alerts:
             msg = (
                 f"🎯 <b>New role at {company}</b>\n"
@@ -870,6 +930,7 @@ def main():
                 f"🔗 {job['url']}"
             )
             send_telegram(msg)
+            time.sleep(0.3)  # gentle rate-limit
         print(f"Sent {len(alerts)} alerts.")
 
     Path(SEEN_FILE).write_text(json.dumps(sorted(new_seen), indent=2))
