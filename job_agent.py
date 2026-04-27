@@ -1,10 +1,11 @@
 """
-Job Posting Notifier Agent — Google Sheets edition (v1.2)
+Job Posting Notifier Agent — Google Sheets edition (v1.3)
 Reads target companies from a published Google Sheet, scrapes careers portals,
 sends Telegram alerts for new matching roles.
 
 Changelog:
-- v1.2: Hardened fuzzy matching (token_set_ratio, threshold 90, length guard)
+- v1.3: Playwright support for JS-heavy sites (Google, Microsoft Careers)
+- v1.2: Hardened fuzzy matching
 - v1.1: Match-only baseline, smarter title matching, HTML scraper de-dup
 """
 import csv
@@ -13,8 +14,9 @@ import json
 import os
 import re
 import hashlib
+import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 import requests
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
@@ -25,9 +27,8 @@ SEEN_FILE = "seen_jobs.json"
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT = os.environ.get("TG_CHAT_ID")
 
-# Fuzzy matching tuning
-FUZZY_THRESHOLD = 90         # how close 'close enough' is (0-100)
-FUZZY_MIN_LENGTH = 8         # don't fuzzy-match keywords shorter than this
+FUZZY_THRESHOLD = 90
+FUZZY_MIN_LENGTH = 8
 
 HEADERS = {
     "User-Agent": (
@@ -81,10 +82,18 @@ def detect_scraper(url):
         if slug:
             return "ashby", {"slug": slug}
 
+    # Google Careers: any URL on google.com/about/careers
+    if "google.com" in host and "careers" in path:
+        return "playwright_google", {}
+
+    # Microsoft Careers
+    if "careers.microsoft.com" in host or "jobs.careers.microsoft.com" in host:
+        return "playwright_microsoft", {}
+
     return None, None
 
 
-# ---------- SCRAPERS ----------
+# ---------- API SCRAPERS ----------
 def scrape_greenhouse(board_token):
     url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs"
     r = requests.get(url, headers=HEADERS, timeout=20)
@@ -128,7 +137,6 @@ def scrape_ashby(slug):
 
 
 def scrape_html(url, selector):
-    """HTML scraper with URL-based de-duplication."""
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -151,6 +159,182 @@ def scrape_html(url, selector):
     return jobs
 
 
+# ---------- PLAYWRIGHT SCRAPERS ----------
+# Lazy-import Playwright so non-Playwright runs don't pay the import cost
+_playwright_browser = None
+
+def _get_browser():
+    """Lazy-init a single browser instance shared across all Playwright scrapes."""
+    global _playwright_browser
+    if _playwright_browser is None:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        _playwright_browser = pw.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ])
+    return _playwright_browser
+
+
+def _close_browser():
+    global _playwright_browser
+    if _playwright_browser is not None:
+        try:
+            _playwright_browser.close()
+        except Exception:
+            pass
+        _playwright_browser = None
+
+
+def _new_page():
+    """Create a new browser context with realistic settings to reduce bot detection."""
+    browser = _get_browser()
+    ctx = browser.new_context(
+        user_agent=HEADERS["User-Agent"],
+        viewport={"width": 1366, "height": 800},
+        locale="en-US",
+    )
+    return ctx, ctx.new_page()
+
+
+def scrape_playwright_google(target_titles, target_country):
+    """
+    Scrape Google Careers. Builds a search URL from your filters and parses
+    the rendered job list. Heavy lifting — only use when needed.
+    """
+    # Google Careers expects a query string + location in URL
+    query = " OR ".join(f'"{t}"' for t in target_titles) if target_titles else ""
+    base = "https://www.google.com/about/careers/applications/jobs/results/"
+    params = []
+    if query:
+        params.append(f"q={quote(query)}")
+    if target_country:
+        params.append(f"location={quote(target_country)}")
+    url = base + ("?" + "&".join(params) if params else "")
+    print(f"  [Playwright] GET {url}")
+
+    ctx, page = _new_page()
+    jobs = []
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # Google Careers loads results dynamically. Wait for job cards or 'no results'.
+        try:
+            page.wait_for_selector("ul li.lLd3Je, [role=listitem] h3", timeout=20000)
+        except Exception:
+            print("  [Playwright] No job cards rendered (timeout or no results)")
+            return []
+
+        # Scroll a bit to trigger lazy loading
+        for _ in range(3):
+            page.mouse.wheel(0, 1500)
+            time.sleep(1)
+
+        # Extract job cards. Selectors are based on Google Careers DOM at time of writing.
+        cards = page.query_selector_all("ul li")
+        for card in cards:
+            try:
+                title_el = card.query_selector("h3")
+                if not title_el:
+                    continue
+                title = title_el.inner_text().strip()
+                if not title:
+                    continue
+                # Location can appear in a few different spans — try common ones
+                loc_text = ""
+                loc_el = card.query_selector("[aria-label*='Location'], .pwO9Dc, .r0wTof")
+                if loc_el:
+                    loc_text = loc_el.inner_text().strip()
+
+                link_el = card.query_selector("a")
+                href = link_el.get_attribute("href") if link_el else ""
+                if href and href.startswith("/"):
+                    href = urljoin("https://www.google.com", href)
+
+                jobs.append({"title": title, "location": loc_text, "url": href or url})
+            except Exception:
+                continue
+
+    finally:
+        ctx.close()
+
+    # De-dupe within scrape
+    seen_keys = set()
+    unique = []
+    for j in jobs:
+        key = (j["url"], j["title"].lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique.append(j)
+    return unique
+
+
+def scrape_playwright_microsoft(target_titles, target_country):
+    """Scrape Microsoft Careers via their search UI."""
+    query = " ".join(target_titles) if target_titles else ""
+    base = "https://jobs.careers.microsoft.com/global/en/search"
+    params = []
+    if query:
+        params.append(f"q={quote(query)}")
+    if target_country:
+        params.append(f"lc={quote(target_country)}")
+    params.append("pg=1")
+    params.append("pgSz=20")
+    url = base + "?" + "&".join(params)
+    print(f"  [Playwright] GET {url}")
+
+    ctx, page = _new_page()
+    jobs = []
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            # Microsoft uses role-based markup
+            page.wait_for_selector("[role=listitem], .ms-List-cell", timeout=20000)
+        except Exception:
+            print("  [Playwright] No job cards rendered (timeout or no results)")
+            return []
+
+        time.sleep(2)  # let JS settle
+
+        cards = page.query_selector_all(".ms-List-cell, [role=listitem]")
+        for card in cards:
+            try:
+                # MS job titles are typically in h2 or h3
+                title_el = card.query_selector("h2, h3, [class*='jobTitle']")
+                if not title_el:
+                    continue
+                title = title_el.inner_text().strip()
+                if not title:
+                    continue
+
+                # Location often has aria-label or specific class
+                loc_text = ""
+                loc_el = card.query_selector("[aria-label*='Location'], [class*='location']")
+                if loc_el:
+                    loc_text = loc_el.inner_text().strip()
+
+                link_el = card.query_selector("a")
+                href = link_el.get_attribute("href") if link_el else ""
+                if href and href.startswith("/"):
+                    href = urljoin("https://jobs.careers.microsoft.com", href)
+
+                jobs.append({"title": title, "location": loc_text, "url": href or url})
+            except Exception:
+                continue
+    finally:
+        ctx.close()
+
+    seen_keys = set()
+    unique = []
+    for j in jobs:
+        key = (j["url"], j["title"].lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique.append(j)
+    return unique
+
+
 def fetch_jobs(company):
     stype = company["scraper_type"].lower()
 
@@ -170,6 +354,10 @@ def fetch_jobs(company):
         return scrape_lever(**args)
     if stype == "ashby":
         return scrape_ashby(**args)
+    if stype == "playwright_google":
+        return scrape_playwright_google(company["target_titles"], company["country"])
+    if stype == "playwright_microsoft":
+        return scrape_playwright_microsoft(company["target_titles"], company["country"])
     if stype.startswith("html:"):
         selector = stype[5:].strip()
         return scrape_html(company["url"], selector)
@@ -180,10 +368,6 @@ def fetch_jobs(company):
 
 # ---------- MATCHING ----------
 def normalize_title(text):
-    """
-    Lowercase + replace separators with spaces, collapse whitespace.
-    'ML/AI-Engineer, Sr.' → 'ml ai engineer sr'
-    """
     text = text.lower()
     text = re.sub(r"[\/\-_,.()\[\]]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -195,23 +379,17 @@ def matches(job, target_titles, target_country):
     norm_loc = normalize_title(job["location"])
 
     title_match = False
-
     for t in target_titles:
         norm_target = normalize_title(t)
         if not norm_target:
             continue
 
-        # Method 1: strict token matching (preferred — fast, precise).
-        # All tokens in your keyword must be present as whole words in the title.
         target_tokens = norm_target.split()
         title_tokens = norm_title.split()
         if all(tok in title_tokens for tok in target_tokens):
             title_match = True
             break
 
-        # Method 2: fuzzy fallback for typos/minor variations.
-        # Only triggers for keywords long enough that fuzz won't false-positive
-        # on tiny words. token_set_ratio is word-aware unlike partial_ratio.
         if len(norm_target) >= FUZZY_MIN_LENGTH:
             score = fuzz.token_set_ratio(norm_target, norm_title)
             if score >= FUZZY_THRESHOLD:
@@ -223,7 +401,6 @@ def matches(job, target_titles, target_country):
         or not norm_loc
         or normalize_title(target_country) in norm_loc
     )
-
     return title_match and country_match
 
 
@@ -263,31 +440,35 @@ def main():
     alerts = []
     total_jobs_scanned = 0
 
-    for c in companies:
-        print(f"→ {c['name']}")
-        try:
-            jobs = fetch_jobs(c)
-        except Exception as e:
-            print(f"  [!] Failed: {e}")
-            continue
-
-        company_matches = 0
-        for job in jobs:
-            jid = job_id(c["name"], job)
-            is_match = matches(job, c["target_titles"], c["country"])
-            if is_match:
-                company_matches += 1
-
-            if jid in seen:
+    try:
+        for c in companies:
+            print(f"→ {c['name']}")
+            try:
+                jobs = fetch_jobs(c)
+            except Exception as e:
+                print(f"  [!] Failed: {e}")
                 continue
 
-            if is_match:
-                new_seen.add(jid)
-                if not first_run:
-                    alerts.append((c["name"], job))
+            company_matches = 0
+            for job in jobs:
+                jid = job_id(c["name"], job)
+                is_match = matches(job, c["target_titles"], c["country"])
+                if is_match:
+                    company_matches += 1
 
-        total_jobs_scanned += len(jobs)
-        print(f"  {len(jobs)} jobs scanned, {company_matches} match criteria")
+                if jid in seen:
+                    continue
+
+                if is_match:
+                    new_seen.add(jid)
+                    if not first_run:
+                        alerts.append((c["name"], job))
+
+            total_jobs_scanned += len(jobs)
+            print(f"  {len(jobs)} jobs scanned, {company_matches} match criteria")
+    finally:
+        # Always close the browser if Playwright was used
+        _close_browser()
 
     if first_run:
         baseline_count = len(new_seen)
