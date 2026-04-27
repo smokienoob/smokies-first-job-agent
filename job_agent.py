@@ -1,7 +1,8 @@
 """
-Job Posting Notifier Agent — Google Sheets edition (v2.0)
-- v2.0: Workday, SmartRecruiters, BambooHR, Taleo, SuccessFactors,
-        Airbnb (Playwright). Microsoft DOM selector fix.
+Job Posting Notifier Agent — Google Sheets edition (v2.1)
+- v2.1: Microsoft selector hardened. Debug dump fires when extraction returns
+        zero jobs even if a selector matched.
+- v2.0: Workday, SmartRecruiters, BambooHR, Taleo, SuccessFactors, Airbnb.
 - v1.4: Playwright debug dump
 - v1.3: Playwright support
 - v1.2: Hardened fuzzy matching
@@ -89,7 +90,6 @@ def detect_scraper(url):
         if slug:
             return "smartrecruiters", {"company_slug": slug}
 
-    # Workday: <tenant>.<wdN>.myworkdayjobs.com/[lang/]<site>
     if "myworkdayjobs.com" in host:
         host_parts = host.split(".")
         if len(host_parts) >= 4:
@@ -105,29 +105,25 @@ def detect_scraper(url):
         if len(path_parts) >= 3 and path_parts[0] == "recruiting":
             return "workday_alt", {"tenant": path_parts[1], "site": path_parts[2]}
 
-    # BambooHR: <company>.bamboohr.com
     if "bamboohr.com" in host:
         sub = host.split(".")[0]
         if sub and sub != "www":
             return "bamboohr", {"company_slug": sub}
 
-    # SuccessFactors
     if "successfactors" in host or "/careersection/" in path:
         return "successfactors", {"raw_url": url}
 
-    # Taleo
     if "taleo.net" in host:
         return "taleo", {"raw_url": url}
 
-    # Custom Playwright sites
     if "revolut.com" in host and "career" in path:
         return "playwright_revolut", {}
 
     if "google.com" in host and "careers" in path:
         return "playwright_google", {}
 
-    if ("careers.airbnb.com" in host or "careers.airbnb" in host) or \
-       ("airbnb.com" in host and "career" in path):
+    if ("careers.airbnb.com" in host or
+            ("airbnb.com" in host and "career" in path)):
         return "playwright_airbnb", {}
 
     if "careers.microsoft.com" in host or "jobs.careers.microsoft.com" in host:
@@ -201,7 +197,6 @@ def scrape_smartrecruiters(company_slug):
 
 
 def scrape_bamboohr(company_slug):
-    """BambooHR public jobs JSON endpoint."""
     url = f"https://{company_slug}.bamboohr.com/careers/list"
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
@@ -270,8 +265,6 @@ def _scrape_workday_endpoint(api_url, base_host):
 
 # ---------- SUCCESSFACTORS ----------
 def scrape_successfactors(raw_url):
-    """SuccessFactors HTML parsing. Tenants vary, so we look for telltale
-    job links in the page."""
     try:
         r = requests.get(raw_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -281,7 +274,6 @@ def scrape_successfactors(raw_url):
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
     seen_urls = set()
-    # Common SF link patterns
     for el in soup.select("a[href*='jobReqId'], a[href*='jobsearch'], "
                           "a[href*='jobdetails'], a.jobTitle-link"):
         title = el.get_text(strip=True)
@@ -296,14 +288,12 @@ def scrape_successfactors(raw_url):
         seen_urls.add(key)
         jobs.append({"title": title, "location": "", "url": href})
     if not jobs:
-        print(f"  [SuccessFactors] No jobs extracted from HTML. Tenant may "
-              f"render results via JS — would need Playwright fallback.")
+        print(f"  [SuccessFactors] No jobs extracted from HTML.")
     return jobs
 
 
 # ---------- TALEO ----------
 def scrape_taleo(raw_url):
-    """Taleo: server-rendered job lists. Parse HTML."""
     try:
         r = requests.get(raw_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -326,8 +316,6 @@ def scrape_taleo(raw_url):
             continue
         seen_urls.add(key)
         jobs.append({"title": title, "location": "", "url": href})
-    if not jobs:
-        print(f"  [Taleo] No job links found at {raw_url}.")
     return jobs
 
 
@@ -397,9 +385,18 @@ def _debug_dump(page, label):
         title = page.title()
         url = page.url
         body_text = page.evaluate("() => document.body.innerText.slice(0, 1500)")
+        # Show all elements with role=listitem and their inner structure
+        listitems_info = page.evaluate("""() => {
+            const items = document.querySelectorAll('[role="listitem"]');
+            return Array.from(items).slice(0, 5).map((el, i) => ({
+                idx: i,
+                outerHTML_preview: el.outerHTML.slice(0, 400),
+                text_preview: el.innerText.slice(0, 200),
+            }));
+        }""")
         headings = page.evaluate("""() => {
             const els = document.querySelectorAll('h1, h2, h3');
-            return Array.from(els).slice(0, 20).map(e => ({
+            return Array.from(els).slice(0, 15).map(e => ({
                 tag: e.tagName.toLowerCase(),
                 text: e.innerText.trim().slice(0, 100),
                 classes: e.className.slice(0, 80)
@@ -407,6 +404,10 @@ def _debug_dump(page, label):
         }""")
         print(f"  [DEBUG {label}] title='{title}' url='{url}'")
         print(f"  [DEBUG {label}] body_text_preview:\n{'-'*40}\n{body_text[:800]}\n{'-'*40}")
+        print(f"  [DEBUG {label}] first {len(listitems_info)} role=listitem elements:")
+        for item in listitems_info:
+            print(f"    [{item['idx']}] text: {item['text_preview']}")
+            print(f"        html: {item['outerHTML_preview']}")
         print(f"  [DEBUG {label}] first {len(headings)} headings:")
         for h in headings:
             print(f"    <{h['tag']} class='{h['classes']}'> {h['text']}")
@@ -443,12 +444,13 @@ def scrape_playwright_google(target_titles, target_country):
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(5)
+        cards = []
         for sel in ["li.lLd3Je", "[role=listitem]", "ul li:has(h3)"]:
             cards = page.query_selector_all(sel)
             if cards:
                 print(f"  [Playwright] Selector '{sel}' matched {len(cards)} elements")
                 break
-        else:
+        if not cards:
             _debug_dump(page, "google")
             return []
 
@@ -473,13 +475,17 @@ def scrape_playwright_google(target_titles, target_country):
                 jobs.append({"title": title, "location": loc_text, "url": href or url})
             except Exception:
                 continue
+        # Trigger debug dump if extraction got nothing
+        if not jobs:
+            print("  [Playwright] Extracted 0 jobs despite matched selector. Dumping page.")
+            _debug_dump(page, "google")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
 
 
 def scrape_playwright_microsoft(target_titles, target_country):
-    """Microsoft Careers — fixed selectors based on current DOM (April 2026)."""
+    """Microsoft Careers — improved extraction with broader title hunting."""
     query = " ".join(target_titles) if target_titles else ""
     base = "https://jobs.careers.microsoft.com/global/en/search"
     params = []
@@ -495,25 +501,25 @@ def scrape_playwright_microsoft(target_titles, target_country):
     jobs = []
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # MS site does heavy client-side rendering — wait longer
         time.sleep(8)
 
-        # Try multiple modern selectors (their CSS class names change but data attributes are stabler)
+        # Try multiple containers
         candidates = [
             "div[role='listitem']",
             "[data-automation-id*='jobCard']",
             "div[class*='ms-List-cell']",
             "div[class*='SearchResultCard']",
             "div[class*='jobCard']",
-            "li[class*='search-result']",
         ]
         cards = []
+        chosen_sel = None
         for sel in candidates:
             try:
                 found = page.query_selector_all(sel)
                 if found:
                     print(f"  [Playwright] Selector '{sel}' matched {len(found)} elements")
                     cards = found
+                    chosen_sel = sel
                     break
             except Exception:
                 continue
@@ -522,24 +528,45 @@ def scrape_playwright_microsoft(target_titles, target_country):
             _debug_dump(page, "microsoft")
             return []
 
+        # Extract — try MANY title sources per card
         for card in cards:
             try:
-                # Try multiple title patterns
                 title = ""
-                for tsel in ["h2", "h3", "[class*='jobTitle']", "[class*='Title']",
-                             "[data-automation-id*='jobTitle']", "a"]:
+                # Strategy: get all text content of the card, take first non-trivial line
+                # that looks like a job title (more than 5 chars, not a button label)
+                full_text = card.inner_text() if card else ""
+                # Try heading first
+                for tsel in ["h2", "h3", "h4", "[role='heading']",
+                             "[class*='jobTitle']", "[class*='Title']",
+                             "a[aria-label]"]:
                     title_el = card.query_selector(tsel)
                     if title_el:
-                        cand = title_el.inner_text().strip()
-                        if cand and len(cand) > 3:
-                            title = cand.split("\n")[0]
+                        # Try aria-label first if it's an anchor — often holds full title
+                        aria = title_el.get_attribute("aria-label") if tsel.startswith("a") else None
+                        cand = aria or title_el.inner_text().strip()
+                        if cand and len(cand) > 5:
+                            title = cand.split("\n")[0].strip()
                             break
+
+                # Fallback: parse first meaningful line of text
+                if not title and full_text:
+                    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+                    # Skip lines that look like buttons / metadata
+                    skip_keywords = {"save", "apply", "share", "view", "details",
+                                     "remote", "hybrid", "onsite", "full-time", "part-time"}
+                    for line in lines:
+                        line_lower = line.lower()
+                        if line and len(line) > 5 and line_lower not in skip_keywords \
+                                and not any(line_lower == k for k in skip_keywords):
+                            title = line[:120]
+                            break
+
                 if not title:
                     continue
 
                 loc_text = ""
                 for lsel in ["[aria-label*='Location']", "[class*='location']",
-                             "[class*='Location']", "[data-automation-id*='location']"]:
+                             "[class*='Location']"]:
                     loc_el = card.query_selector(lsel)
                     if loc_el:
                         loc_text = loc_el.inner_text().strip()
@@ -552,6 +579,12 @@ def scrape_playwright_microsoft(target_titles, target_country):
                 jobs.append({"title": title, "location": loc_text, "url": href or url})
             except Exception:
                 continue
+
+        # If extraction failed entirely, dump the page
+        if not jobs:
+            print(f"  [Playwright] Extracted 0 jobs from {len(cards)} '{chosen_sel}' "
+                  f"elements. Dumping page for diagnosis.")
+            _debug_dump(page, "microsoft")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
@@ -573,13 +606,14 @@ def scrape_playwright_revolut(target_titles, target_country):
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(6)
+        cards = []
         for sel in ["a[href*='/careers/position/']", "div[class*='JobCard']",
                     "[data-testid*='job']"]:
             cards = page.query_selector_all(sel)
             if cards:
                 print(f"  [Playwright] Selector '{sel}' matched {len(cards)} elements")
                 break
-        else:
+        if not cards:
             _debug_dump(page, "revolut")
             return []
 
@@ -603,13 +637,14 @@ def scrape_playwright_revolut(target_titles, target_country):
                 jobs.append({"title": title, "location": loc_text, "url": href or url})
             except Exception:
                 continue
+        if not jobs:
+            _debug_dump(page, "revolut")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
 
 
 def scrape_playwright_airbnb(target_titles, target_country):
-    """Airbnb careers — JS-rendered custom site."""
     base = "https://careers.airbnb.com/positions/"
     print(f"  [Playwright] GET {base}")
 
@@ -618,47 +653,32 @@ def scrape_playwright_airbnb(target_titles, target_country):
     try:
         page.goto(base, wait_until="domcontentloaded", timeout=45000)
         time.sleep(6)
-        # Lazy-load: scroll a few times to trigger more results
         for _ in range(4):
             page.mouse.wheel(0, 2000)
             time.sleep(1)
 
-        candidates = [
-            "a[href*='/positions/']",
-            "div[class*='position']",
-            "li[class*='position']",
-            "[data-testid*='position']",
-        ]
         cards = []
-        for sel in candidates:
-            try:
-                found = page.query_selector_all(sel)
-                if found and len(found) > 1:
-                    print(f"  [Playwright] Selector '{sel}' matched {len(found)} elements")
-                    cards = found
-                    break
-            except Exception:
-                continue
-
+        for sel in ["a[href*='/positions/']", "div[class*='position']"]:
+            found = page.query_selector_all(sel)
+            if found and len(found) > 1:
+                print(f"  [Playwright] Selector '{sel}' matched {len(found)} elements")
+                cards = found
+                break
         if not cards:
             _debug_dump(page, "airbnb")
             return []
 
         for card in cards:
             try:
-                # Title — try heading first
                 title_el = card.query_selector("h2, h3, h4, [class*='title']")
                 title = title_el.inner_text().strip() if title_el else ""
                 if not title:
-                    # Fallback for anchor cards: take first line
                     raw = card.inner_text().strip()
                     title = raw.split("\n")[0][:120] if raw else ""
                 if not title or len(title) < 3:
                     continue
-
                 loc_el = card.query_selector("[class*='location'], [class*='Location']")
                 loc_text = loc_el.inner_text().strip() if loc_el else ""
-
                 tag = card.evaluate("el => el.tagName")
                 if tag == "A":
                     href = card.get_attribute("href")
@@ -667,10 +687,11 @@ def scrape_playwright_airbnb(target_titles, target_country):
                     href = a.get_attribute("href") if a else ""
                 if href and href.startswith("/"):
                     href = urljoin("https://careers.airbnb.com", href)
-
                 jobs.append({"title": title, "location": loc_text, "url": href or base})
             except Exception:
                 continue
+        if not jobs:
+            _debug_dump(page, "airbnb")
     finally:
         ctx.close()
     return _dedupe_jobs(jobs)
@@ -679,7 +700,6 @@ def scrape_playwright_airbnb(target_titles, target_country):
 # ---------- DISPATCHER ----------
 def fetch_jobs(company):
     stype = company["scraper_type"].lower()
-
     if stype == "auto":
         detected, args = detect_scraper(company["url"])
         if not detected:
