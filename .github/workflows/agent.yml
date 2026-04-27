@@ -9,6 +9,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -18,8 +19,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
-        run: pip install requests beautifulsoup4 rapidfuzz
+      - name: Install Python deps
+        run: pip install requests beautifulsoup4 rapidfuzz playwright
+
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps chromium
 
       - name: Run agent
         env:
