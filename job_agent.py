@@ -223,63 +223,117 @@ def scrape_bamboohr(company_slug):
 
 
 def scrape_eightfold(raw_url):
-    """Eightfold (Netflix, others) embeds positions data as JSON in the page.
-    We fetch the careers page and extract the JSON block."""
-    # Eightfold also has an API — try that first
+    """Eightfold (Netflix, others). Paginates the public API.
+ 
+    The page is served at e.g. https://explore.jobs.netflix.net/careers
+    and the underlying API is at /api/apply/v2/jobs on the same host.
+    """
+    from urllib.parse import urlparse, urljoin
     parsed = urlparse(raw_url)
     host = parsed.netloc.lower()
-
-    # Try the API endpoint pattern Eightfold uses
-    api_url = f"https://{host}/api/apply/v2/jobs?domain={host.replace('explore.jobs.', '').replace('.net', '.com')}"
-    api_url += "&start=0&num=100&exact_phrase=&query=&Country=&Location=&"
-    try:
-        r = requests.get(api_url, headers=HEADERS, timeout=20)
-        if r.status_code == 200:
+ 
+    # The 'domain' parameter the API expects is the company's main domain
+    # (e.g. netflix.com), derived from the explore.jobs.<x>.net subdomain.
+    if "explore.jobs." in host:
+        # explore.jobs.netflix.net → netflix.com
+        domain_part = host.replace("explore.jobs.", "").rsplit(".", 1)[0]
+        domain = f"{domain_part}.com"
+    else:
+        # Fallback: just strip jobs/careers prefixes
+        domain = host.replace("jobs.", "").replace("careers.", "")
+ 
+    api_base = f"https://{host}/api/apply/v2/jobs"
+    jobs = []
+    page_size = 100
+    max_pages = 5  # 500 jobs total cap
+ 
+    for page in range(max_pages):
+        start = page * page_size
+        params = {
+            "domain": domain,
+            "start": start,
+            "num": page_size,
+            "exact_phrase": "",
+            "query": "",
+            "Country": "",
+            "Location": "",
+        }
+        try:
+            r = requests.get(api_base, params=params, headers=HEADERS, timeout=20)
+            if r.status_code != 200:
+                if page == 0:
+                    print(f"  [Eightfold] API returned {r.status_code}, falling back to HTML")
+                    return _scrape_eightfold_html(raw_url)
+                else:
+                    break
             data = r.json()
-            positions = data.get("positions", [])
-            if positions:
-                return _parse_eightfold_positions(positions)
-    except Exception:
-        pass
-
-    # Fallback: scrape the embedded JSON from the careers page
+        except Exception as e:
+            if page == 0:
+                print(f"  [Eightfold] API call failed ({e}), falling back to HTML")
+                return _scrape_eightfold_html(raw_url)
+            else:
+                break
+ 
+        positions = data.get("positions", [])
+        if not positions:
+            break
+ 
+        jobs.extend(_parse_eightfold_positions(positions))
+ 
+        # Stop if we got fewer than requested (no more pages)
+        if len(positions) < page_size:
+            break
+ 
+        time.sleep(0.3)  # be polite
+ 
+    print(f"  [Eightfold] Retrieved {len(jobs)} jobs across {page + 1} page(s)")
+    return jobs
+ 
+ 
+def _scrape_eightfold_html(raw_url):
+    """Fallback: extract embedded JSON from the careers page HTML."""
     try:
         r = requests.get(raw_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
     except Exception as e:
-        print(f"  [Eightfold] Fetch failed: {e}")
+        print(f"  [Eightfold] HTML fetch failed: {e}")
         return []
-
-    # Look for "positions": [...] block in the page source
-    match = re.search(r'"positions"\s*:\s*(\[[^\]]*\])', r.text)
+ 
+    match = re.search(r'"positions"\s*:\s*(\[.*?\])\s*,\s*"', r.text, re.DOTALL)
     if not match:
-        # Try a more lenient match — capture larger JSON
-        match = re.search(r'"positions":\s*(\[.*?\])\s*,\s*"', r.text, re.DOTALL)
+        match = re.search(r'"positions"\s*:\s*(\[[^\]]*\])', r.text)
     if not match:
-        print(f"  [Eightfold] Could not find positions JSON in page.")
+        print(f"  [Eightfold] Could not find positions JSON in HTML.")
         return []
-
+ 
     try:
         positions = json.loads(match.group(1))
     except Exception as e:
         print(f"  [Eightfold] JSON parse failed: {e}")
         return []
-
     return _parse_eightfold_positions(positions)
-
-
+ 
+ 
 def _parse_eightfold_positions(positions):
     jobs = []
     for p in positions:
         title = p.get("name") or p.get("posting_name") or ""
         if not title:
             continue
-        # Locations can be a list or a single string
         locs = p.get("locations") or [p.get("location", "")]
-        loc_str = " | ".join(filter(None, locs)) if isinstance(locs, list) else str(locs)
+        if isinstance(locs, list):
+            loc_str = " | ".join(filter(None, locs))
+        else:
+            loc_str = str(locs)
         url = p.get("canonicalPositionUrl") or ""
         jobs.append({"title": title, "location": loc_str, "url": url})
     return jobs
+ 
+
+
+
+
+
 
 
 # ---------- WORKDAY ----------
