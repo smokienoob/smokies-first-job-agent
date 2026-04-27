@@ -1,11 +1,11 @@
 """
-Job Posting Notifier Agent — Google Sheets edition (v1.1)
+Job Posting Notifier Agent — Google Sheets edition (v1.2)
 Reads target companies from a published Google Sheet, scrapes careers portals,
 sends Telegram alerts for new matching roles.
 
 Changelog:
-- v1.1: Match-only baseline (Bug #1), smarter title matching (Edge #1),
-        HTML scraper de-duplication (Edge #9)
+- v1.2: Hardened fuzzy matching (token_set_ratio, threshold 90, length guard)
+- v1.1: Match-only baseline, smarter title matching, HTML scraper de-dup
 """
 import csv
 import io
@@ -17,12 +17,17 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
+from rapidfuzz import fuzz
 
 # ---------- CONFIG ----------
 SHEET_CSV_URL = os.environ.get("SHEET_CSV_URL")
 SEEN_FILE = "seen_jobs.json"
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT = os.environ.get("TG_CHAT_ID")
+
+# Fuzzy matching tuning
+FUZZY_THRESHOLD = 90         # how close 'close enough' is (0-100)
+FUZZY_MIN_LENGTH = 8         # don't fuzzy-match keywords shorter than this
 
 HEADERS = {
     "User-Agent": (
@@ -123,12 +128,12 @@ def scrape_ashby(slug):
 
 
 def scrape_html(url, selector):
-    """HTML scraper with URL-based de-duplication (Edge #9)."""
+    """HTML scraper with URL-based de-duplication."""
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
-    seen_urls = set()  # de-dupe within one scrape
+    seen_urls = set()
     for el in soup.select(selector):
         title = el.get_text(strip=True)
         if not title:
@@ -138,7 +143,6 @@ def scrape_html(url, selector):
         if href and href.startswith("/"):
             href = urljoin(url, href)
         href = href or url
-        # Skip if we've already captured this URL+title combo on this scrape
         dedup_key = (href, title.lower())
         if dedup_key in seen_urls:
             continue
@@ -177,9 +181,8 @@ def fetch_jobs(company):
 # ---------- MATCHING ----------
 def normalize_title(text):
     """
-    Lowercase + replace separators (/, -, _, ., comma) with spaces,
-    collapse multiple spaces. So 'ML/AI-Engineer, Sr.' becomes 'ml ai engineer sr'.
-    Then word-boundary matching works reliably (Edge #1).
+    Lowercase + replace separators with spaces, collapse whitespace.
+    'ML/AI-Engineer, Sr.' → 'ml ai engineer sr'
     """
     text = text.lower()
     text = re.sub(r"[\/\-_,.()\[\]]+", " ", text)
@@ -192,24 +195,35 @@ def matches(job, target_titles, target_country):
     norm_loc = normalize_title(job["location"])
 
     title_match = False
+
     for t in target_titles:
         norm_target = normalize_title(t)
         if not norm_target:
             continue
-        # Word-boundary match against the normalized strings.
-        # Now 'ml engineer' matches 'ml ai engineer' (token presence),
-        # and 'data engineer' matches 'data engineer ii'.
+
+        # Method 1: strict token matching (preferred — fast, precise).
+        # All tokens in your keyword must be present as whole words in the title.
         target_tokens = norm_target.split()
         title_tokens = norm_title.split()
         if all(tok in title_tokens for tok in target_tokens):
             title_match = True
             break
 
+        # Method 2: fuzzy fallback for typos/minor variations.
+        # Only triggers for keywords long enough that fuzz won't false-positive
+        # on tiny words. token_set_ratio is word-aware unlike partial_ratio.
+        if len(norm_target) >= FUZZY_MIN_LENGTH:
+            score = fuzz.token_set_ratio(norm_target, norm_title)
+            if score >= FUZZY_THRESHOLD:
+                title_match = True
+                break
+
     country_match = (
         not target_country
         or not norm_loc
         or normalize_title(target_country) in norm_loc
     )
+
     return title_match and country_match
 
 
@@ -246,7 +260,6 @@ def main():
     first_run = not Path(SEEN_FILE).exists()
     seen = set(json.loads(Path(SEEN_FILE).read_text())) if not first_run else set()
     new_seen = set(seen)
-    matched_ids = set()  # tracks matching jobs only (Bug #1 fix)
     alerts = []
     total_jobs_scanned = 0
 
@@ -262,17 +275,12 @@ def main():
         for job in jobs:
             jid = job_id(c["name"], job)
             is_match = matches(job, c["target_titles"], c["country"])
-
             if is_match:
-                matched_ids.add(jid)
                 company_matches += 1
 
             if jid in seen:
                 continue
 
-            # Only baseline/track jobs that match our criteria (Bug #1 fix).
-            # Non-matching jobs are ignored entirely — if they later become
-            # interesting (e.g., user adds keyword), they'll be evaluated fresh.
             if is_match:
                 new_seen.add(jid)
                 if not first_run:
