@@ -1,7 +1,11 @@
 """
-Job Posting Notifier Agent — Google Sheets edition
+Job Posting Notifier Agent — Google Sheets edition (v1.1)
 Reads target companies from a published Google Sheet, scrapes careers portals,
 sends Telegram alerts for new matching roles.
+
+Changelog:
+- v1.1: Match-only baseline (Bug #1), smarter title matching (Edge #1),
+        HTML scraper de-duplication (Edge #9)
 """
 import csv
 import io
@@ -119,17 +123,27 @@ def scrape_ashby(slug):
 
 
 def scrape_html(url, selector):
+    """HTML scraper with URL-based de-duplication (Edge #9)."""
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
+    seen_urls = set()  # de-dupe within one scrape
     for el in soup.select(selector):
         title = el.get_text(strip=True)
+        if not title:
+            continue
         link_el = el if el.name == "a" else el.find("a")
         href = link_el.get("href") if link_el else url
         if href and href.startswith("/"):
             href = urljoin(url, href)
-        jobs.append({"title": title, "location": "", "url": href or url})
+        href = href or url
+        # Skip if we've already captured this URL+title combo on this scrape
+        dedup_key = (href, title.lower())
+        if dedup_key in seen_urls:
+            continue
+        seen_urls.add(dedup_key)
+        jobs.append({"title": title, "location": "", "url": href})
     return jobs
 
 
@@ -161,16 +175,40 @@ def fetch_jobs(company):
 
 
 # ---------- MATCHING ----------
+def normalize_title(text):
+    """
+    Lowercase + replace separators (/, -, _, ., comma) with spaces,
+    collapse multiple spaces. So 'ML/AI-Engineer, Sr.' becomes 'ml ai engineer sr'.
+    Then word-boundary matching works reliably (Edge #1).
+    """
+    text = text.lower()
+    text = re.sub(r"[\/\-_,.()\[\]]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def matches(job, target_titles, target_country):
-    title_lower = job["title"].lower()
-    loc_lower = job["location"].lower()
-    title_match = any(
-        re.search(rf"\b{re.escape(t.lower())}\b", title_lower) for t in target_titles
-    )
+    norm_title = normalize_title(job["title"])
+    norm_loc = normalize_title(job["location"])
+
+    title_match = False
+    for t in target_titles:
+        norm_target = normalize_title(t)
+        if not norm_target:
+            continue
+        # Word-boundary match against the normalized strings.
+        # Now 'ml engineer' matches 'ml ai engineer' (token presence),
+        # and 'data engineer' matches 'data engineer ii'.
+        target_tokens = norm_target.split()
+        title_tokens = norm_title.split()
+        if all(tok in title_tokens for tok in target_tokens):
+            title_match = True
+            break
+
     country_match = (
         not target_country
-        or not loc_lower
-        or target_country.lower() in loc_lower
+        or not norm_loc
+        or normalize_title(target_country) in norm_loc
     )
     return title_match and country_match
 
@@ -208,7 +246,9 @@ def main():
     first_run = not Path(SEEN_FILE).exists()
     seen = set(json.loads(Path(SEEN_FILE).read_text())) if not first_run else set()
     new_seen = set(seen)
+    matched_ids = set()  # tracks matching jobs only (Bug #1 fix)
     alerts = []
+    total_jobs_scanned = 0
 
     for c in companies:
         print(f"→ {c['name']}")
@@ -218,21 +258,39 @@ def main():
             print(f"  [!] Failed: {e}")
             continue
 
+        company_matches = 0
         for job in jobs:
             jid = job_id(c["name"], job)
+            is_match = matches(job, c["target_titles"], c["country"])
+
+            if is_match:
+                matched_ids.add(jid)
+                company_matches += 1
+
             if jid in seen:
                 continue
-            new_seen.add(jid)
-            if matches(job, c["target_titles"], c["country"]):
-                alerts.append((c["name"], job))
 
-        print(f"  {len(jobs)} jobs scanned")
+            # Only baseline/track jobs that match our criteria (Bug #1 fix).
+            # Non-matching jobs are ignored entirely — if they later become
+            # interesting (e.g., user adds keyword), they'll be evaluated fresh.
+            if is_match:
+                new_seen.add(jid)
+                if not first_run:
+                    alerts.append((c["name"], job))
+
+        total_jobs_scanned += len(jobs)
+        print(f"  {len(jobs)} jobs scanned, {company_matches} match criteria")
 
     if first_run:
-        print(f"First run: baselining {len(new_seen)} jobs (no alerts sent).")
+        baseline_count = len(new_seen)
+        print(f"First run: baselining {baseline_count} matching jobs "
+              f"(out of {total_jobs_scanned} total scanned). No alerts sent.")
         send_telegram(
-            f"✅ Job agent activated — tracking {len(companies)} companies, "
-            f"{len(new_seen)} current jobs baselined. You'll get alerts for new postings."
+            f"✅ Job agent activated\n"
+            f"Tracking {len(companies)} companies\n"
+            f"Found {baseline_count} jobs matching your criteria right now "
+            f"(out of {total_jobs_scanned} open roles)\n"
+            f"You'll get alerts only for NEW matching postings going forward."
         )
     else:
         for company, job in alerts:
