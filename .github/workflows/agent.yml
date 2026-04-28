@@ -2,8 +2,8 @@ name: Job Agent
 
 on:
   schedule:
-    # 3x daily at 08:00, 14:00, 20:00 IST (02:30, 08:30, 14:30 UTC)
-    - cron: '30 2,8,14 * * *'
+    # 3x daily at 08:447, 14:47, 20:47 IST (04:17, 10:17, 16:17 UTC)
+    - cron: '17 4,10,16 * * *'
   workflow_dispatch:
 
 jobs:
