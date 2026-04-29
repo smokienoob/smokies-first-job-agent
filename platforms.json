@@ -39,7 +39,7 @@
     "platform": "Unknown",
     "scraper_key": "",
     "url": "https://jobs.apple.com/en-in/search",
-    "active": true
+    "active": false
   },
   "Adobe": {
     "platform": "Workday",
@@ -48,21 +48,21 @@
     "active": true
   },
   "Salesforce": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://careers.salesforce.com/en/jobs/?search=",
+    "platform": "Workday",
+    "scraper_key": "workday",
+    "url": "https://salesforce.wd12.myworkdayjobs.com/External_Career_Site",
     "active": true
   },
   "Uber": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://www.uber.com/in/en/careers/list/",
+    "platform": "Greenhouse",
+    "scraper_key": "greenhouse",
+    "url": "https://boards.greenhouse.io/uber",
     "active": true
   },
   "Atlassian": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://www.atlassian.com/company/careers/all-jobs",
+    "platform": "Greenhouse",
+    "scraper_key": "greenhouse",
+    "url": "https://boards.greenhouse.io/atlassian",
     "active": true
   },
   "Snowflake": {
@@ -72,9 +72,9 @@
     "active": true
   },
   "Databricks": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://www.databricks.com/company/careers/open-positions",
+    "platform": "Greenhouse",
+    "scraper_key": "greenhouse",
+    "url": "https://boards.greenhouse.io/databricks",
     "active": true
   },
   "Revolut": {
@@ -102,21 +102,21 @@
     "active": false
   },
   "Stripe": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://stripe.com/jobs/search",
+    "platform": "Greenhouse",
+    "scraper_key": "greenhouse",
+    "url": "https://boards.greenhouse.io/stripe",
     "active": false
   },
   "Hubspot": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://www.hubspot.com/careers",
+    "platform": "Workday",
+    "scraper_key": "workday",
+    "url": "https://hubspot.wd5.myworkdayjobs.com/HubSpot",
     "active": true
   },
   "Rippling": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://www.rippling.com/en-IN/careers/open-roles",
+    "platform": "Greenhouse",
+    "scraper_key": "greenhouse",
+    "url": "https://boards.greenhouse.io/rippling",
     "active": true
   }
 }
