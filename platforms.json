@@ -1,1 +1,122 @@
-{}
+{
+  "Google": {
+    "platform": "Google Careers",
+    "scraper_key": "playwright_google",
+    "url": "https://www.google.com/about/careers/applications",
+    "active": true
+  },
+  "Microsoft": {
+    "platform": "Microsoft Careers",
+    "scraper_key": "playwright_microsoft",
+    "url": "https://jobs.careers.microsoft.com/global/en/search",
+    "active": true
+  },
+  "Notion": {
+    "platform": "Ashby",
+    "scraper_key": "ashby",
+    "url": "https://jobs.ashbyhq.com/notion",
+    "active": true
+  },
+  "GSK": {
+    "platform": "Workday",
+    "scraper_key": "workday",
+    "url": "https://gsk.wd5.myworkdayjobs.com/GSKCareers",
+    "active": true
+  },
+  "Netflix": {
+    "platform": "Eightfold",
+    "scraper_key": "eightfold",
+    "url": "https://explore.jobs.netflix.net/careers",
+    "active": true
+  },
+  "AirBnB": {
+    "platform": "Airbnb",
+    "scraper_key": "playwright_airbnb",
+    "url": "https://careers.airbnb.com/positions/",
+    "active": true
+  },
+  "Apple": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://jobs.apple.com/en-in/search",
+    "active": true
+  },
+  "Adobe": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://careers.adobe.com/us/en/search-results",
+    "active": true
+  },
+  "Salesforce": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://careers.salesforce.com/en/jobs/?search=",
+    "active": true
+  },
+  "Uber": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://www.uber.com/in/en/careers/list/",
+    "active": true
+  },
+  "Atlassian": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://www.atlassian.com/company/careers/all-jobs",
+    "active": true
+  },
+  "Snowflake": {
+    "platform": "Ashby",
+    "scraper_key": "ashby",
+    "url": "https://jobs.ashbyhq.com/snowflake",
+    "active": true
+  },
+  "Databricks": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://www.databricks.com/company/careers/open-positions",
+    "active": true
+  },
+  "Revolut": {
+    "platform": "Revolut",
+    "scraper_key": "playwright_revolut",
+    "url": "https://www.revolut.com/careers/search",
+    "active": true
+  },
+  "Grab": {
+    "platform": "SmartRecruiters",
+    "scraper_key": "smartrecruiters",
+    "url": "https://careers.smartrecruiters.com/oneclick-ui",
+    "active": true
+  },
+  "Nvidia": {
+    "platform": "Eightfold",
+    "scraper_key": "eightfold",
+    "url": "https://nvidia.eightfold.ai/careers?start=0&pid=893382722436&sort_by=timestamp",
+    "active": true
+  },
+  "AMD": {
+    "platform": "iCIMS",
+    "scraper_key": "",
+    "url": "https://careers-amd.icims.com/jobs/",
+    "active": false
+  },
+  "Stripe": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://stripe.com/jobs/search",
+    "active": false
+  },
+  "Hubspot": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://www.hubspot.com/careers",
+    "active": true
+  },
+  "Rippling": {
+    "platform": "Unknown",
+    "scraper_key": "",
+    "url": "https://www.rippling.com/en-IN/careers/open-roles",
+    "active": true
+  }
+}
