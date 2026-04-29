@@ -1,0 +1,24 @@
+name: Update Sheet Platforms
+
+on:
+  workflow_dispatch:   # run manually whenever you add new companies
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests gspread google-auth
+
+      - name: Run sheet updater
+        env:
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python sheet_updater.py
