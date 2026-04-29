@@ -42,9 +42,9 @@
     "active": true
   },
   "Adobe": {
-    "platform": "Unknown",
-    "scraper_key": "",
-    "url": "https://careers.adobe.com/us/en/search-results",
+    "platform": "Workday",
+    "scraper_key": "workday",
+    "url": "https://adobe.wd5.myworkdayjobs.com/external_experienced/job/San-Jose/Senior-Data-Engineer---Architect_R166033-1/apply",
     "active": true
   },
   "Salesforce": {
