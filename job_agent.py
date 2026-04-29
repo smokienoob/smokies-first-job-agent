@@ -45,11 +45,9 @@ HEADERS = {
 """
 PATCH for job_agent.py — replace load_companies_from_sheet() with this version.
 
-This reads the sheet CSV as before, but ALSO reads platforms.json (written by
-sheet_updater.py) to get the correct scraper_key per company.
-
-platforms.json takes priority over whatever is in the 'Scraper Type' column.
-If a company isn't in platforms.json yet, it falls back to the sheet value.
+The previous patch was passing scraper_key directly which broke the dispatcher.
+This version passes the corrected URL from platforms.json and lets the existing
+detect_scraper() figure out the arguments — which is what the dispatcher needs.
 """
 
 def load_companies_from_sheet():
@@ -62,6 +60,7 @@ def load_companies_from_sheet():
     if platforms_file.exists():
         try:
             platforms = json.loads(platforms_file.read_text())
+            print(f"  (platforms.json loaded — {len(platforms)} entries)")
         except Exception as e:
             print(f"[!] Could not read platforms.json: {e}")
 
@@ -79,31 +78,28 @@ def load_companies_from_sheet():
 
         company_name = row["company"]
 
-        # Get scraper type: platforms.json takes priority over sheet column
+        # Use the corrected URL from platforms.json if available, otherwise sheet URL
         platform_entry = platforms.get(company_name, {})
-        scraper_key = platform_entry.get("scraper_key", "")
-        # Use corrected URL from platforms.json if available
         url = platform_entry.get("url") or row.get("careers url", "")
 
-        # Fall back to sheet's Scraper Type column if platforms.json has nothing
-        if not scraper_key:
-            scraper_key = row.get("scraper type", "auto") or "auto"
+        # Skip companies that platforms.json marks as Unknown / unsupported
+        if platform_entry.get("platform") == "Unknown":
+            print(f"  [skip] {company_name}: platform Unknown in platforms.json")
+            continue
+        if platform_entry.get("platform") and not platform_entry.get("scraper_key"):
+            print(f"  [skip] {company_name}: unsupported platform "
+                  f"({platform_entry.get('platform')})")
+            continue
 
-        # If still empty (unsupported platform), set to auto so detect_scraper runs
-        # (it will print a warning if it can't detect)
-        if not scraper_key:
-            scraper_key = "auto"
-
+        # Always use 'auto' as scraper_type so detect_scraper() runs against the
+        # corrected URL — that gives the dispatcher both the type AND its args.
         companies.append({
             "name": company_name,
             "url": url,
-            "scraper_type": scraper_key,
+            "scraper_type": "auto",
             "target_titles": [t.strip() for t in row.get("target titles", "").split(",") if t.strip()],
             "country": row.get("country", ""),
         })
-
-    if platforms:
-        print(f"  (platforms.json loaded — {len(platforms)} entries)")
 
     return companies
 
