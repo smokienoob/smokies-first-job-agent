@@ -42,28 +42,70 @@ HEADERS = {
 
 
 # ---------- SHEET LOADER ----------
+"""
+PATCH for job_agent.py — replace load_companies_from_sheet() with this version.
+
+This reads the sheet CSV as before, but ALSO reads platforms.json (written by
+sheet_updater.py) to get the correct scraper_key per company.
+
+platforms.json takes priority over whatever is in the 'Scraper Type' column.
+If a company isn't in platforms.json yet, it falls back to the sheet value.
+"""
+
 def load_companies_from_sheet():
     if not SHEET_CSV_URL:
         raise RuntimeError("SHEET_CSV_URL env var not set")
+
+    # Load platforms.json if it exists
+    platforms = {}
+    platforms_file = Path("platforms.json")
+    if platforms_file.exists():
+        try:
+            platforms = json.loads(platforms_file.read_text())
+        except Exception as e:
+            print(f"[!] Could not read platforms.json: {e}")
+
     r = requests.get(SHEET_CSV_URL, headers=HEADERS, timeout=20)
     r.raise_for_status()
     reader = csv.DictReader(io.StringIO(r.text))
     companies = []
+
     for row in reader:
         row = {k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
         if not row.get("company") or not row.get("careers url"):
             continue
-        if row.get("active", "true").upper() == "FALSE":
+        if row.get("active", "true").upper() in ("FALSE", "NO", "0"):
             continue
+
+        company_name = row["company"]
+
+        # Get scraper type: platforms.json takes priority over sheet column
+        platform_entry = platforms.get(company_name, {})
+        scraper_key = platform_entry.get("scraper_key", "")
+        # Use corrected URL from platforms.json if available
+        url = platform_entry.get("url") or row.get("careers url", "")
+
+        # Fall back to sheet's Scraper Type column if platforms.json has nothing
+        if not scraper_key:
+            scraper_key = row.get("scraper type", "auto") or "auto"
+
+        # If still empty (unsupported platform), set to auto so detect_scraper runs
+        # (it will print a warning if it can't detect)
+        if not scraper_key:
+            scraper_key = "auto"
+
         companies.append({
-            "name": row["company"],
-            "url": row["careers url"],
-            "scraper_type": row.get("scraper type", "auto") or "auto",
+            "name": company_name,
+            "url": url,
+            "scraper_type": scraper_key,
             "target_titles": [t.strip() for t in row.get("target titles", "").split(",") if t.strip()],
             "country": row.get("country", ""),
         })
-    return companies
 
+    if platforms:
+        print(f"  (platforms.json loaded — {len(platforms)} entries)")
+
+    return companies
 
 # ---------- AUTO-DETECT ----------
 def detect_scraper(url):
